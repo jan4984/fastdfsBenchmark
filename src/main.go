@@ -24,6 +24,7 @@ type testDesc struct {
 		Pct int
 		Count int
 		Cfg []writeCfg
+		Clean bool
 	}
 	Read struct {
 		Pct int
@@ -65,14 +66,14 @@ func main() {
 			{"Max":15000, "Min":3000, "Pct":95},
 			{"Max":300000, "Min":100000, "Pct":3},
 			{"Max":800000, "Min":300000, "Pct":2}
-		]
+		],
+		"Clean":true
 	},
 	"Read":{
 		"Pct":10
 	}
 }
 `
-
 	c := make(chan os.Signal, 1)
 	signal.Notify(c, os.Interrupt)
 	go func(){
@@ -121,6 +122,8 @@ func main() {
 
 	writeBuf := make([]byte, maxBufLen)
 	taskChan := make(chan task, td.Parallel * 2)
+	readTimeChan := make(chan int64, td.Read.Count)
+	writeTimeChan := make(chan int64, td.Write.Count)
 	workerWg := sync.WaitGroup{}
 
 	writeCount := int64(0)
@@ -136,54 +139,60 @@ func main() {
 		 go func(i int){
 			 //mgr:=gls.NewContextManager();
 			 //mgr.SetValues(gls.Values{"id":i}, func() {
-				 defer func() {
-					 log.Println("to quit worker ", i)
-					 workerWg.Done()
-				 }()
-
-				 type writeRslt struct{
-					 id string
-					 size int
+			 type writeRslt struct{
+				 id string
+				 size int
+			 }
+			 wroteIDS := make([]writeRslt, 0)
+			 defer func() {
+				 for _,i:=range wroteIDS{
+					 client.DeleteFile(i.id)
 				 }
-				 wroteIDS := make([]writeRslt, 0)
-				 idsLen := 0
-				 rnd := rand.New(rand.NewSource(int64(time.Now().Nanosecond())))
+				 log.Println("to quit worker ", i)
+				 workerWg.Done()
+			 }()
 
-				 loop:
-				 for {
-					 //log.Println(i, " waitting task")
-					 select {
-					 //for t:= range taskChan{
-					 case t, ok := <-taskChan:
-						 if t.writeLen > 0 {
-							 wc := int(atomic.AddInt64(&writeCount, 1))
-							 rd := int(atomic.LoadInt64(&readCount))
+			 idsLen := 0
+			 rnd := rand.New(rand.NewSource(int64(time.Now().Nanosecond())))
+
+			 loop:
+			 for {
+				 //log.Println(i, " waitting task")
+				 select {
+				 //for t:= range taskChan{
+				 case t, ok := <-taskChan:
+					 if t.writeLen > 0 {
+						 wc := int(atomic.AddInt64(&writeCount, 1))
+						 rd := int(atomic.LoadInt64(&readCount))
+						 start := time.Now()
+						 //log.Println(i, "to write ", t.writeLen)
+						 id := doWrite(client, writeBuf[0:t.writeLen])
+						 //log.Println(i, "done write ", t.writeLen)
+						 wt:=int64(time.Now().Sub(start))
+						 atomic.AddInt64(&report.TotalWriteTime, wt)
+						 writeTimeChan <- wt
+						 wroteIDS = append(wroteIDS, writeRslt{id,int(t.writeLen)})
+						 idsLen++
+						 if reachPct(int64(td.Write.Pct), int64(wc), int64(rd + wc)) {
+							 atomic.AddInt64(&readCount, 1)
 							 start := time.Now()
-							 //log.Println(i, "to write ", t.writeLen)
-							 id := doWrite(client, writeBuf[0:t.writeLen])
-							 //log.Println(i, "done write ", t.writeLen)
-							 atomic.AddInt64(&report.TotalWriteTime, int64(time.Now().Sub(start)))
-							 wroteIDS = append(wroteIDS, writeRslt{id,int(t.writeLen)})
-							 idsLen++
-							 if reachPct(int64(td.Write.Pct), int64(wc), int64(rd + wc)) {
-								 atomic.AddInt64(&readCount, 1)
-								 start := time.Now()
-								 id := wroteIDS[rnd.Int31n(int32(idsLen))]
-								 //log.Println(i, "to read ", id.id)
-								 inc := doRead(client, id.id)
-								 //log.Println(i, "done read ", id.id)
-								 if inc != id.size {
-									 log.Fatalln("wrote ", id.size, " but read ", inc, " for file:", id.id)
-								 }
-								 atomic.AddInt64(&report.TotalReadTime, int64(time.Now().Sub(start)))
-								 atomic.AddInt64(&report.TotalReadBytes, int64(inc))
+							 id := wroteIDS[rnd.Int31n(int32(idsLen))]
+							 log.Println(i, "to read ", id.id)
+							 inc := doRead(client, id.id)
+							 //log.Println(i, "done read ", id.id)
+							 if inc != id.size {
+								 log.Fatalln("wrote ", id.size, " but read ", inc, " for file:", id.id)
 							 }
-						 }
-						 if !ok {
-							 break loop
+							 rt:=int64(time.Now().Sub(start))
+							 readTimeChan<- rt
+							 atomic.AddInt64(&report.TotalReadTime, rt)
+							 atomic.AddInt64(&report.TotalReadBytes, int64(inc))
 						 }
 					 }
-				 //}
+					 if !ok {
+						 break loop
+					 }
+				 }
 			 }
 		}(i)
 	}
@@ -211,10 +220,48 @@ func main() {
 	}
 	close(taskChan)
 
+	ptsReaderWg :=sync.WaitGroup{}
+	readPts := make([]int64,0,td.Read.Count)
+	ptsReaderWg.Add(1)
+	go func(){
+		defer func(){
+			ptsReaderWg.Done()
+		}()
+		for {
+			rt,ok:= <- readTimeChan
+			if ok {
+				readPts=append(readPts, rt)
+			}else{
+				break;
+			}
+		}
+	}();
+
+	writePts := make([]int64,0,td.Write.Count)
+	ptsReaderWg.Add(1)
+	go func(){
+		defer func(){
+			ptsReaderWg.Done()
+		}()
+		for {
+			wt,ok := <- writeTimeChan
+			if ok {
+				writePts=append(writePts, wt)
+			}else{
+				break;
+			}
+		}
+	}()
 
 	log.Println("to wait task finish")
 	workerWg.Wait()
 	report.End = time.Now()
+	close(writeTimeChan)
+	close(readTimeChan)
+	ptsReaderWg.Wait()
+
+	os.Stdout.Write([]byte(fmt.Sprintf("%v\n", readPts)))
+	os.Stdout.Write([]byte(fmt.Sprintf("%v\n", writePts)))
 	report.Duration = report.End.Sub(report.Start)
 	report.AvgReadDuration = time.Duration(report.TotalReadTime / readCount)
 	report.AvgWriteDuration = time.Duration(report.TotalWriteTime / writeCount)
