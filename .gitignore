@@ -1,3 +1,4 @@
 .idea
 pkg
 *.iml
+src/github.com
