@@ -21,9 +21,9 @@ func NewFdfsClient(cfgPath string ) Fs{
 func (this *fdfsclient)DoRead(path string) (int,[]byte,error){
 	if rsp,err:=this.fdfs.DownloadToBuffer(path, 0, 0);err != nil || rsp.DownloadSize < 0{
 		log.Fatalln("download ", path, " error:", err)
-		return -1, err;
+		return -1, nil, err;
 	}else{
-		return int(rsp.DownloadSize),rsp.Content.(*[]byte),nil
+		return int(rsp.DownloadSize),rsp.Content.([]byte),nil
 	}
 }
 func (this *fdfsclient)DoWrite(refPath string, data[]byte) (string, error){

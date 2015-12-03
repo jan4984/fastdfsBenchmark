@@ -9,17 +9,19 @@ import (
 	"bytes"
 	"mime/multipart"
 	"io"
+	"fmt"
+	"log"
 )
 
 type weedclient struct{
 	root string
-	volMapLock sync.RWMutex
+	volMapLock *sync.RWMutex
 	volMap map[string]string
 }
 
 type volLookUpRst struct{
-	locations []struct{
-		publicUrl string `json:"publicUrl"`
+	Locations []struct{
+		PublicUrl string `json:"publicUrl"`
 	} `json:"locations"`
 }
 
@@ -36,8 +38,8 @@ func (this *weedclient)fetchVolumeUrl(id string) (string, error){
 		return "", err
 	}
 
-	if len(rst.locations) > 0{
-		return rst.locations[0].publicUrl
+	if len(rst.Locations) > 0{
+		return rst.Locations[0].PublicUrl, nil
 	}
 
 	return "", errors.New("no url for id "+id)
@@ -66,62 +68,78 @@ func getVolId(path string) string{
 }
 
 func NewWeedFsClient(urlroot string ) Fs{
-	return &weedclient{urlroot};
+	log.Println("new seaweedfs client to", urlroot)
+	return &weedclient{urlroot, &sync.RWMutex{}, make(map[string]string)};
 }
 
-func (this *weedclient)DoRead(path string) (int, []byte, error){
-	var err error
-	var vurl string
-	var ok bool
-
+func (this* weedclient)getVolumeUrl(path string)(string,error){
 	vid := getVolId(path)
-	if vid == ""{
-		return -1,nil,errors.New("wrong path:"+path)
-	}
-
 	this.volMapLock.RLock()
-	if vurl,ok = this.volMap[vid];!ok{
+	if vurl,ok := this.volMap[vid];!ok{
 		this.volMapLock.RUnlock()
 
-		vurl, err = this.fetchVolumeUrl(vid)
+		vurl, err := this.fetchVolumeUrl(vid)
 		if(err != nil){
-			return -1,nil,err
+			return "",err
 		}
 		this.volMapLock.Lock()
 		this.volMap[vid]=vurl
 		this.volMapLock.Unlock()
+		return vurl,nil
 	}else {
 		this.volMapLock.RUnlock()
+		return vurl,nil
 	}
+}
+
+func (this *weedclient)DoRead(path string) (int, []byte, error){
+	vurl,err:=this.getVolumeUrl(path)
+	if err!=nil{
+		return -1,nil,err
+	}
+
 	var buf []byte
-	buf, err = this.fetchFile(vurl+"/"+path);
+	buf, err = this.fetchFile("http://"+vurl+"/"+path);
 	if err != nil{
 		return -1,nil,err
 	}
 	return len(buf),buf,nil
 }
 type assignRst struct{
-	fid string `json:"fid"`
+	Fid string `json:"fid"`
 }
 type wroteRst struct{
-	name string `json:"name"`
-	size int `json:"size"`
+	Name string `json:"name"`
+	Size int `json:"size"`
 }
 func (this *weedclient)DoWrite(refPath string, data[]byte) (string,error){
 	rsp,err := http.Post(this.root+"/dir/assign", "text/plain", nil)
 	if err != nil {
 		return "", err
 	}
-	jd:=json.NewDecoder(rsp.Body)
+	buf,err:=ioutil.ReadAll(rsp.Body)
+	if err != nil {
+		return "",err
+	}
+	//jd:=json.NewDecoder(rsp.Body)
 	defer rsp.Body.Close()
 
 	var fid string
-	{
+	if fid,err = func() (string,error){
 		rst := assignRst{}
-		if err := jd.Decode(&rst); err != nil {
-			return "", err
+		//log.Println("to unmarshal", string(buf))
+		if err := json.Unmarshal(buf, &rst); err != nil {
+			return "", errors.New(fmt.Sprintf("decoding assign result %s failed %v", string(buf), err))
 		}
-		fid = rst.fid
+		fid = rst.Fid
+		return fid,nil
+	}();err != nil{
+		return "",err
+	}
+
+	vurl,err := this.getVolumeUrl(fid)
+	if err != nil{
+		return "", err
 	}
 
 	body := &bytes.Buffer{}
@@ -131,31 +149,40 @@ func (this *weedclient)DoWrite(refPath string, data[]byte) (string,error){
 	if err != nil {
 		return "", err
 	}
-	_, err = io.Copy(wr, instream)
+	n, err := io.Copy(wr, instream)
 	if err != nil && err != io.EOF {
 		return "", err
 	}
+	if int(n) != len(data){
+		return "", errors.New("not copy enough data")
+	}
 	multipartWriter.Close();
 
-	req,err := http.NewRequest("PUT", this.root + "/" + fid, body)
+	req,err := http.NewRequest("PUT", "http://"+vurl + "/" + fid, body)
 	if err != nil{
 		return "", err
 	}
+	req.Header.Set("Content-Type", multipartWriter.FormDataContentType())
 
 	rsp, err = http.DefaultClient.Do(req)
 	if err != nil {
 		return "", err
 	}
-	jd = json.Decoder{rsp.Body}
+	buf,err=ioutil.ReadAll(rsp.Body)
+	if err != nil {
+		return "",err
+	}
+	//jd := json.NewDecoder(rsp.Body)
 	defer rsp.Body.Close()
 
 	rst := wroteRst{}
-	if err := jd.Decode(&rst);err != nil{
-		return "",err
+	//log.Println("upload response:", string(buf))
+	if err := json.Unmarshal(buf,&rst);err != nil{
+		return "",errors.New(fmt.Sprintf("decoding assign result %s failed %v", string(buf), err))
 	}
 
-	if rst.size != len(data){
-		return "", errors.New("wrote " + rst.size + " but required " + len(data))
+	if rst.Size != len(data){
+		return "", errors.New(fmt.Sprintf("wrote %d but required %d", rst.Size, len(data)))
 	}
 
 	return fid, nil
@@ -171,8 +198,7 @@ func (this *weedclient)DoDelete(path string) error{
 		return err
 	}
 	if rsp.StatusCode != 200 {
-		return errors.New("response status " + rsp.StatusCode)
+		return errors.New(fmt.Sprint("response status " ,rsp.StatusCode))
 	}
 	return nil
 }
-

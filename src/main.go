@@ -15,6 +15,7 @@ import (
 	"runtime"
 	"fmt"
 	"fs"
+	"io/ioutil"
 )
 
 type testDesc struct {
@@ -56,10 +57,11 @@ type reportStr struct{
 }
 
 func main() {
+	log.SetFlags(log.Llongfile)
 	defaultTestDesc := `
 {
-	"TotalCount":1000,
-	"Parallel":10,
+	"TotalCount":100,
+	"Parallel":1,
 	"Write":{
 		"Pct":90,
 		"Cfg":[
@@ -102,7 +104,7 @@ func main() {
 		flag.Usage()
 		return
 	}
-	log.Println("to use fastDFS config file", *fdfsCfgFile)
+	//log.Println("to use fastDFS config file", *fdfsCfgFile)
 	if *testDescStr == "see default test description" {
 		log.Println("to use default test description")
 		*testDescStr = defaultTestDesc
@@ -274,8 +276,10 @@ func main() {
 	close(readTimeChan)
 	ptsReaderWg.Wait()
 
-	os.Stdout.Write([]byte(fmt.Sprintf("%v\n", readPts)))
-	os.Stdout.Write([]byte(fmt.Sprintf("%v\n", writePts)))
+	//os.Stdout.Write()
+	//os.Stdout.Write([]byte(fmt.Sprintf("%v\n", writePts)))
+	ioutil.WriteFile("readPts.txt", []byte(fmt.Sprintf("%v\n", readPts)), os.ModePerm)
+	ioutil.WriteFile("writePts.txt", []byte(fmt.Sprintf("%v\n", writePts)), os.ModePerm)
 	report.Duration = report.End.Sub(report.Start)
 	report.AvgReadDuration = time.Duration(report.TotalReadTime / readCount)
 	report.AvgWriteDuration = time.Duration(report.TotalWriteTime / writeCount)
