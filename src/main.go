@@ -3,7 +3,6 @@ package main
 import (
 	"encoding/json"
 	"flag"
-	"github.com/weilaihui/fdfs_client"
 	"log"
 	"sync"
 	"sync/atomic"
@@ -15,6 +14,7 @@ import (
 	"os/signal"
 	"runtime"
 	"fmt"
+	"fs"
 )
 
 type testDesc struct {
@@ -83,7 +83,9 @@ func main() {
 	}()
 
 	var report reportStr
-	fdfsCfgFile := flag.String("fa", "", "(must)fastDFS config file path")
+	fsType := flag.String("ft", "fastdfs", "(must) fastdfs or seaweedfs")
+	fdfsCfgFile := flag.String("fa", "", "(must for fastdfs)fastDFS config file path")
+	seaweedfsUrlRoot := flag.String("sr", "", "(must for seaweedfs)seaweedfs master server and port, like 127.0.0.1:9333")
 	origUsage := flag.Usage
 	flag.Usage = func() {
 		log.Println("the default test description is")
@@ -92,7 +94,11 @@ func main() {
 	}
 	testDescStr := flag.String("td", "see default test description", "(opt)test description")
 	flag.Parse()
-	if *fdfsCfgFile == "" {
+	if *fdfsCfgFile == "" && *fsType=="fastdfs"{
+		flag.Usage()
+		return
+	}
+	if *seaweedfsUrlRoot=="" && *fsType=="seaweedfs"{
 		flag.Usage()
 		return
 	}
@@ -118,8 +124,6 @@ func main() {
 		c.Count = c.Pct * td.Write.Count
 	}
 
-	var err error
-
 	writeBuf := make([]byte, maxBufLen)
 	taskChan := make(chan task, td.Parallel * 2)
 	readTimeChan := make(chan int64, td.Read.Count)
@@ -129,10 +133,14 @@ func main() {
 	writeCount := int64(0)
 	readCount := int64(0)
 
-	var client *fdfs_client.FdfsClient
-	if client,err=fdfs_client.NewFdfsClient("client.conf");err != nil{
-		log.Fatal(err)
+	var client fstestbenchmark.Fs
+	switch(*fsType){
+	case "fastdfs":
+		client = fstestbenchmark.NewFdfsClient(*fdfsCfgFile)
+	case "seaweedfs":
+		client = fstestbenchmark.NewWeedFsClient("http://" + *seaweedfsUrlRoot)
 	}
+
 
 	for i:=0;i<td.Parallel;i++{
 		workerWg.Add(1)
@@ -146,7 +154,7 @@ func main() {
 			 wroteIDS := make([]writeRslt, 0)
 			 defer func() {
 				 for _,i:=range wroteIDS{
-					 client.DeleteFile(i.id)
+					 client.DoDelete(i.id)
 				 }
 				 log.Println("to quit worker ", i)
 				 workerWg.Done()
@@ -166,7 +174,10 @@ func main() {
 						 rd := int(atomic.LoadInt64(&readCount))
 						 start := time.Now()
 						 //log.Println(i, "to write ", t.writeLen)
-						 id := doWrite(client, writeBuf[0:t.writeLen])
+						 id,err := client.DoWrite("filename", writeBuf[0:t.writeLen])
+						 if err != nil {
+							 log.Fatalln(err)
+						 }
 						 //log.Println(i, "done write ", t.writeLen)
 						 wt:=int64(time.Now().Sub(start))
 						 atomic.AddInt64(&report.TotalWriteTime, wt)
@@ -178,7 +189,10 @@ func main() {
 							 start := time.Now()
 							 id := wroteIDS[rnd.Int31n(int32(idsLen))]
 							 log.Println(i, "to read ", id.id)
-							 inc := doRead(client, id.id)
+							 inc,_,err := client.DoRead(id.id)
+							 if err != nil {
+								 log.Fatalln(err)
+							 }
 							 //log.Println(i, "done read ", id.id)
 							 if inc != id.size {
 								 log.Fatalln("wrote ", id.size, " but read ", inc, " for file:", id.id)
@@ -282,24 +296,6 @@ func main() {
 
 func reachPct(pct,cnt,total int64) bool{
 	return cnt > (total * pct / 100)
-}
-
-func doRead(client *fdfs_client.FdfsClient, id string) int{
-	if rsp,err:=client.DownloadToBuffer(id, 0, 0);err != nil || rsp.DownloadSize < 0{
-		log.Fatalln("download ", id, " error:", err)
-		return -1
-	}else{
-		return int(rsp.DownloadSize)
-	}
-}
-
-func doWrite(client *fdfs_client.FdfsClient, data []byte) string{
-	if rsp, err :=client.UploadByBuffer(data, ".raw");err != nil{
-		log.Fatalln("upload error:", err)
-		return ""
-	}else {
-		return rsp.RemoteFileId
-	}
 }
 
 func isexist(filename string) bool {
