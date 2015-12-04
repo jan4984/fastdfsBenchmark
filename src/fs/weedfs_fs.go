@@ -163,6 +163,9 @@ func (this *weedclient)DoWrite(refPath string, data[]byte) (string,error){
 		if err := json.Unmarshal(buf, &rst); err != nil {
 			return "", errors.New(fmt.Sprintf("decoding assign result %s failed %v", string(buf), err))
 		}
+		if rst.Fid=="" {
+			return "", errors.New(fmt.Sprintf("assign failed:%v", string(buf)))
+		}
 		fid = rst.Fid
 		return fid,nil
 	}();err != nil{
