@@ -11,12 +11,15 @@ import (
 	"io"
 	"fmt"
 	"log"
+	"net"
+	"time"
 )
 
 type weedclient struct{
 	root string
 	volMapLock *sync.RWMutex
 	volMap map[string]string
+	hc *http.Client
 }
 
 type volLookUpRst struct{
@@ -26,7 +29,7 @@ type volLookUpRst struct{
 }
 
 func (this *weedclient)fetchVolumeUrl(id string) (string, error){
-	rsp, err := http.Get(this.root + "/dir/lookup?volumeId="+id)
+	rsp, err := this.get(this.root + "/dir/lookup?volumeId="+id)
 	if err != nil {
 		return "", err
 	}
@@ -46,7 +49,7 @@ func (this *weedclient)fetchVolumeUrl(id string) (string, error){
 }
 
 func (this* weedclient)fetchFile(path string) ([]byte, error){
-	rsp, err := http.Get(path)
+	rsp, err := this.get(path)
 	if err != nil{
 		return nil,err
 	}
@@ -69,7 +72,16 @@ func getVolId(path string) string{
 
 func NewWeedFsClient(urlroot string ) Fs{
 	log.Println("new seaweedfs client to", urlroot)
-	return &weedclient{urlroot, &sync.RWMutex{}, make(map[string]string)};
+	hc := http.Client{
+		Transport:&http.Transport{
+			Dial:(&net.Dialer{
+				Timeout:5 * time.Second,
+				KeepAlive:30 * time.Second,
+			}).Dial,
+			MaxIdleConnsPerHost:100,
+		},
+	}
+	return &weedclient{urlroot, &sync.RWMutex{}, make(map[string]string), &hc};
 }
 
 func (this* weedclient)getVolumeUrl(path string)(string,error){
@@ -112,8 +124,28 @@ type wroteRst struct{
 	Name string `json:"name"`
 	Size int `json:"size"`
 }
+func (this *weedclient)post(url string, content_type string, body io.Reader) (rsp *http.Response, err error){
+	var req *http.Request
+	req,err = http.NewRequest("POST", url, body)
+	if err != nil {
+		return
+	}
+	rsp,err =this.hc.Do(req)
+	return
+}
+
+func (this *weedclient)get(url string) (rsp *http.Response, err error){
+	var req *http.Request
+	req,err = http.NewRequest("GET", url, nil)
+	if err != nil {
+		return
+	}
+	rsp,err =this.hc.Do(req)
+	return
+}
+
 func (this *weedclient)DoWrite(refPath string, data[]byte) (string,error){
-	rsp,err := http.Post(this.root+"/dir/assign", "text/plain", nil)
+	rsp,err := this.post(this.root+"/dir/assign", "text/plain", nil)
 	if err != nil {
 		return "", err
 	}
@@ -164,7 +196,7 @@ func (this *weedclient)DoWrite(refPath string, data[]byte) (string,error){
 	}
 	req.Header.Set("Content-Type", multipartWriter.FormDataContentType())
 
-	rsp, err = http.DefaultClient.Do(req)
+	rsp, err = this.hc.Do(req)
 	if err != nil {
 		return "", err
 	}
@@ -193,7 +225,7 @@ func (this *weedclient)DoDelete(path string) error{
 	if err != nil {
 		return err
 	}
-	rsp,err :=http.DefaultClient.Do(req)
+	rsp,err :=this.hc.Do(req)
 	if err != nil {
 		return err
 	}
