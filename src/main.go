@@ -31,6 +31,7 @@ type testDesc struct {
 		Pct int
 		Count int
 	}
+	AvgOpsInv int
 }
 
 type task struct{
@@ -73,7 +74,8 @@ func main() {
 	},
 	"Read":{
 		"Pct":10
-	}
+	},
+	"AvgOpsInv":250
 }
 `
 	c := make(chan os.Signal, 1)
@@ -184,6 +186,9 @@ func main() {
 						 rd := int(atomic.LoadInt64(&readCount))
 						 start := time.Now()
 						 //log.Println(i, "to write ", t.writeLen)
+						 if td.AvgOpsInv > 0 {
+							 <-time.Tick(rnd.Intn(td.AvgOpsInv * 2) * time.Second)
+						 }
 						 id,err := client.DoWrite("filename", writeBuf[0:t.writeLen])
 						 if err != nil {
 							 log.Fatalln(err)
@@ -199,6 +204,9 @@ func main() {
 							 start := time.Now()
 							 id := wroteIDS[rnd.Int31n(int32(idsLen))]
 							 log.Println(i, "to read ", id.id)
+							 if td.AvgOpsInv > 0 {
+								 <-time.Tick(rnd.Intn(td.AvgOpsInv * 2) * time.Second)
+							 }
 							 inc,_,err := client.DoRead(id.id)
 							 if err != nil {
 								 log.Fatalln(err)
