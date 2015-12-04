@@ -113,6 +113,14 @@ func main() {
 	td := testDesc{}
 	if err := json.Unmarshal([]byte(*testDescStr), &td); err != nil {
 		log.Println(err)
+		synerr,ok:=err.(*json.SyntaxError)
+		if ok{
+			begin := synerr.Offset - 5
+			if begin < 0{
+				begin = 0
+			}
+			log.Println(synerr.Offset, (*testDescStr)[begin:synerr.Offset])
+		}
 		flag.Usage()
 		return
 	}
