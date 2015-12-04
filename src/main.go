@@ -187,7 +187,7 @@ func main() {
 						 start := time.Now()
 						 //log.Println(i, "to write ", t.writeLen)
 						 if td.AvgOpsInv > 0 {
-							 <-time.Tick(rnd.Intn(td.AvgOpsInv * 2) * time.Second)
+							 <-time.Tick(time.Second * time.Duration(rnd.Int63n(int64(td.AvgOpsInv) * 2)))
 						 }
 						 id,err := client.DoWrite("filename", writeBuf[0:t.writeLen])
 						 if err != nil {
@@ -205,7 +205,7 @@ func main() {
 							 id := wroteIDS[rnd.Int31n(int32(idsLen))]
 							 log.Println(i, "to read ", id.id)
 							 if td.AvgOpsInv > 0 {
-								 <-time.Tick(rnd.Intn(td.AvgOpsInv * 2) * time.Second)
+								 <-time.Tick(time.Second * time.Duration(rnd.Int63n(int64(td.AvgOpsInv) * 2)))
 							 }
 							 inc,_,err := client.DoRead(id.id)
 							 if err != nil {
