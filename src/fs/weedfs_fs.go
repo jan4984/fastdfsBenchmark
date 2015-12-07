@@ -29,15 +29,13 @@ type volLookUpRst struct{
 }
 
 func (this *weedclient)fetchVolumeUrl(id string) (string, error){
-	rsp, err := this.get(this.root + "/dir/lookup?volumeId="+id)
+	buf, err := this.get(this.root + "/dir/lookup?volumeId="+id,true)
 	if err != nil {
 		return "", err
 	}
-	jd:=json.NewDecoder(rsp.Body)
-	defer rsp.Body.Close()
 
 	var rst volLookUpRst
-	if err := jd.Decode(&rst);err != nil{
+	if err := json.Unmarshal(buf, &rst);err != nil{
 		return "", err
 	}
 
@@ -49,17 +47,15 @@ func (this *weedclient)fetchVolumeUrl(id string) (string, error){
 }
 
 func (this* weedclient)fetchFile(path string) ([]byte, error){
-	rsp, err := this.get(path)
+	buf, err := this.get(path, true)
 	if err != nil{
 		return nil,err
 	}
-	b,err:=ioutil.ReadAll(rsp.Body)
-	defer rsp.Body.Close()
 
 	if err!=nil{
 		return nil,err
 	}
-	return b,nil
+	return buf,nil
 }
 
 func getVolId(path string) string{
@@ -124,47 +120,96 @@ type wroteRst struct{
 	Name string `json:"name"`
 	Size int `json:"size"`
 }
-func (this *weedclient)post(url string, content_type string, body io.Reader) (rsp *http.Response, err error){
+func (this *weedclient)post(url string, content_type string, body []byte, failTry bool) (rspBody []byte, err error){
+	defer func(){
+		if err != nil && failTry{
+			rspBody, err = this.post(url, content_type, body, false)
+		}
+	}();
+
 	var req *http.Request
-	req,err = http.NewRequest("POST", url, body)
+	var rsp *http.Response
+	req,err = http.NewRequest("POST", url, bytes.NewBuffer(body))
 	if err != nil {
 		return
 	}
 	rsp,err =this.hc.Do(req)
+	if err != nil {
+		return
+	}
+	rspBody,err = ioutil.ReadAll(rsp.Body)
+	defer rsp.Body.Close()
 	return
 }
 
-func (this *weedclient)get(url string) (rsp *http.Response, err error){
+func (this *weedclient)get(url string, failTry bool) (rspBody []byte, err error){
+	defer func(){
+		if err != nil && failTry{
+			rspBody, err = this.get(url, false)
+		}
+	}();
+
 	var req *http.Request
+	var rsp *http.Response
 	req,err = http.NewRequest("GET", url, nil)
 	if err != nil {
 		return
 	}
-	rsp,err =this.hc.Do(req)
+	rsp,err = this.hc.Do(req)
+	rspBody,err = ioutil.ReadAll(rsp.Body)
+	defer rsp.Body.Close()
+	return
+}
+
+func (this* weedclient)multiPartPut(url string, fileName string, body []byte, failTry bool) (rspBody []byte, err error){
+	defer func(){
+		if err != nil && failTry{
+			rspBody, err = this.multiPartPut(url, fileName, body, false)
+		}
+	}();
+
+	var req *http.Request
+	var rsp *http.Response
+	var wr io.Writer
+	var n int64
+
+	rawMultipart := &bytes.Buffer{}
+	inStream := bytes.NewBuffer(body)
+	multipartWriter := multipart.NewWriter(rawMultipart)
+	wr, err = multipartWriter.CreateFormFile("file", fileName)
+	if err != nil {
+		return
+	}
+	n, err = io.Copy(wr, inStream)
+	if err != nil && err != io.EOF {
+		return
+	}
+	if int(n) != len(body){
+		err = errors.New("not copy enough data")
+		return
+	}
+	multipartWriter.Close();
+
+	req,err = http.NewRequest("PUT", url, bytes.NewBuffer(rawMultipart.Bytes()))
+	if err != nil{
+		return
+	}
+	req.Header.Set("Content-Type", multipartWriter.FormDataContentType())
+
+	rsp, err = this.hc.Do(req)
+	if err != nil {
+		return
+	}
+	rspBody,err=ioutil.ReadAll(rsp.Body)
+	defer rsp.Body.Close()
 	return
 }
 
 func (this *weedclient)DoWrite(refPath string, data[]byte) (string,error){
-	rsp,err := this.post(this.root+"/dir/assign", "text/plain", nil)
-	if err == io.EOF{
-		//for long-term running, i found that the assign api may EOF sometimes, simply try again
-		log.Println("assign unexpected EOF, to try again now")
-		rsp,err = this.post(this.root+"/dir/assign", "text/plain", nil)
-		if err == nil {
-			log.Println("retry successed.")
-		}else{
-			log.Println("retry failed:", err);
-		}
-	}
+	buf,err := this.post(this.root+"/dir/assign", "text/plain", nil, true)
 	if err != nil {
 		return "", err
 	}
-	buf,err:=ioutil.ReadAll(rsp.Body)
-	if err != nil {
-		return "",err
-	}
-	//jd:=json.NewDecoder(rsp.Body)
-	defer rsp.Body.Close()
 
 	var fid string
 	if fid,err = func() (string,error){
@@ -186,50 +231,11 @@ func (this *weedclient)DoWrite(refPath string, data[]byte) (string,error){
 	if err != nil{
 		return "", err
 	}
-
-	body := &bytes.Buffer{}
-	instream := bytes.NewBuffer(data)
-	multipartWriter := multipart.NewWriter(body)
-	wr, err := multipartWriter.CreateFormFile("file", refPath)
-	if err != nil {
-		return "", err
-	}
-	n, err := io.Copy(wr, instream)
-	if err != nil && err != io.EOF {
-		return "", err
-	}
-	if int(n) != len(data){
-		return "", errors.New("not copy enough data")
-	}
-	multipartWriter.Close();
-
-	req,err := http.NewRequest("PUT", "http://"+vurl + "/" + fid, body)
-	if err != nil{
-		return "", err
-	}
-	req.Header.Set("Content-Type", multipartWriter.FormDataContentType())
-
-	rsp, err = this.hc.Do(req)
-	if err != nil {
-		return "", err
-	}
-	buf,err=ioutil.ReadAll(rsp.Body)
-	if err == io.EOF{
-		//for long-term running, i found that the assign api may EOF sometimes, simply try again
-		log.Println("put", "http://"+vurl + "/" + fid,"unexpected EOF, to try again now")
-		rsp, err = this.hc.Do(req)
-		if err == nil {
-			log.Println("retry successed.")
-		}else{
-			log.Println("retry failed:", err);
-		}
-	}
 	if err != nil {
 		return "",err
 	}
-	//jd := json.NewDecoder(rsp.Body)
-	defer rsp.Body.Close()
 
+	buf,err = this.multiPartPut("http://"+vurl + "/" + fid, refPath, data, true)
 	rst := wroteRst{}
 	//log.Println("upload response:", string(buf))
 	if err := json.Unmarshal(buf,&rst);err != nil{
