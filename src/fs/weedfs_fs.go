@@ -152,6 +152,8 @@ func (this *weedclient)DoWrite(refPath string, data[]byte) (string,error){
 		rsp,err = this.post(this.root+"/dir/assign", "text/plain", nil)
 		if err == nil {
 			log.Println("retry successed.")
+		}else{
+			log.Println("retry failed:", err);
 		}
 	}
 	if err != nil {
@@ -212,6 +214,16 @@ func (this *weedclient)DoWrite(refPath string, data[]byte) (string,error){
 		return "", err
 	}
 	buf,err=ioutil.ReadAll(rsp.Body)
+	if err == io.EOF{
+		//for long-term running, i found that the assign api may EOF sometimes, simply try again
+		log.Println("put", "http://"+vurl + "/" + fid,"unexpected EOF, to try again now")
+		rsp, err = this.hc.Do(req)
+		if err == nil {
+			log.Println("retry successed.")
+		}else{
+			log.Println("retry failed:", err);
+		}
+	}
 	if err != nil {
 		return "",err
 	}

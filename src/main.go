@@ -75,7 +75,7 @@ func main() {
 	"Read":{
 		"Pct":10
 	},
-	"AvgOpsInv":250
+	"AvgOpsInv":0
 }
 `
 	c := make(chan os.Signal, 1)
