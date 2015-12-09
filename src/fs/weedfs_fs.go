@@ -156,6 +156,9 @@ func (this *weedclient)get(url string, failTry bool) (rspBody []byte, err error)
 		return
 	}
 	rsp,err = this.hc.Do(req)
+	if err != nil {
+		return
+	}
 	rspBody,err = ioutil.ReadAll(rsp.Body)
 	defer rsp.Body.Close()
 	return
