@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"fs"
 	"io/ioutil"
+	"net"
 )
 
 type testDesc struct {
@@ -61,8 +62,8 @@ func main() {
 	log.SetFlags(log.Llongfile)
 	defaultTestDesc := `
 {
-	"TotalCount":100,
-	"Parallel":1,
+	"TotalCount":1000,
+	"Parallel":10,
 	"Write":{
 		"Pct":90,
 		"Cfg":[
@@ -150,9 +151,16 @@ func main() {
 	case "fastdfs":
 		client = fstestbenchmark.NewFdfsClient(*fdfsCfgFile)
 	case "seaweedfs":
-		client = fstestbenchmark.NewWeedFsClient("http://" + *seaweedfsUrlRoot)
+		client = fstestbenchmark.NewWeedFsClient("http://" + *seaweedfsUrlRoot, &http.Client{
+			Transport:&http.Transport{
+				Dial:(&net.Dialer{
+					Timeout:5 * time.Second,
+					KeepAlive:30 * time.Second,
+				}).Dial,
+				MaxIdleConnsPerHost:100,
+			},
+		})
 	}
-
 
 	for i:=0;i<td.Parallel;i++{
 		workerWg.Add(1)
@@ -189,7 +197,7 @@ func main() {
 						 if td.AvgOpsInv > 0 {
 							 <-time.Tick(time.Second * time.Duration(rnd.Int63n(int64(td.AvgOpsInv) * 2)))
 						 }
-						 id,err := client.DoWrite("filename", writeBuf[0:t.writeLen])
+						 id,err := client.DoWrite("filename", writeBuf[0:t.writeLen], "?replication=001")
 						 if err != nil {
 							 log.Fatalln(err)
 						 }

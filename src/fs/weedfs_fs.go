@@ -11,15 +11,19 @@ import (
 	"io"
 	"fmt"
 	"log"
-	"net"
+	//"net"
 	"time"
+	"math/rand"
+	"sync/atomic"
 )
 
 type weedclient struct{
 	root string
 	volMapLock *sync.RWMutex
-	volMap map[string]string
+	volMap map[string][]string
 	hc *http.Client
+	rnd *rand.Rand
+	lastVolumeUrlQuery int64
 }
 
 type volLookUpRst struct{
@@ -28,26 +32,30 @@ type volLookUpRst struct{
 	} `json:"locations"`
 }
 
-func (this *weedclient)fetchVolumeUrl(id string) (string, error){
-	buf, err := this.get(this.root + "/dir/lookup?volumeId="+id,true)
+func fetchVolumeUrlFromMaster(hc *http.Client, root string, id string) (ret []string, err error){
+	var buf []byte
+	buf, err = get(hc, root + "/dir/lookup?volumeId="+id,true)
 	if err != nil {
-		return "", err
+		return
 	}
 
 	var rst volLookUpRst
-	if err := json.Unmarshal(buf, &rst);err != nil{
-		return "", err
+	if err = json.Unmarshal(buf, &rst);err != nil{
+		return
 	}
 
+	ret = make([]string, 0, len(rst.Locations))
 	if len(rst.Locations) > 0{
-		return rst.Locations[0].PublicUrl, nil
+		for _,l:= range rst.Locations{
+			ret = append(ret, l.PublicUrl)
+		}
 	}
-
-	return "", errors.New("no url for id "+id)
+	//NOTE: may return 0 size []string
+	return
 }
 
-func (this* weedclient)fetchFile(path string) ([]byte, error){
-	buf, err := this.get(path, true)
+func fetchFile(hc *http.Client, path string) ([]byte, error){
+	buf, err := get(hc, path, true)
 	if err != nil{
 		return nil,err
 	}
@@ -58,17 +66,19 @@ func (this* weedclient)fetchFile(path string) ([]byte, error){
 	return buf,nil
 }
 
-func getVolId(path string) string{
+func getVolId(path string) (string, error){
 	ss := strings.Split(path, ",")
 	if len(ss) == 2 {
-		return ss[0]
+		if ss[0] != "" {
+			return ss[0], nil
+		}
 	}
-	return ""
+	return "", errors.New("path in wrong format:" + path)
 }
 
-func NewWeedFsClient(urlroot string ) Fs{
+func NewWeedFsClient(urlroot string, hc *http.Client) Fs{
 	log.Println("new seaweedfs client to", urlroot)
-	hc := http.Client{
+	/*hc := http.Client{
 		Transport:&http.Transport{
 			Dial:(&net.Dialer{
 				Timeout:5 * time.Second,
@@ -76,54 +86,116 @@ func NewWeedFsClient(urlroot string ) Fs{
 			}).Dial,
 			MaxIdleConnsPerHost:100,
 		},
-	}
-	return &weedclient{urlroot, &sync.RWMutex{}, make(map[string]string), &hc};
+	}*/
+	return &weedclient{urlroot, &sync.RWMutex{},
+		make(map[string][]string), hc,
+		rand.New(rand.NewSource(time.Now().Unix())),
+		0};
 }
 
-func (this* weedclient)getVolumeUrl(path string)(string,error){
-	vid := getVolId(path)
+func (this* weedclient)getVUrlFromCache(vid string, exclude string)(string, error){
 	this.volMapLock.RLock()
-	if vurl,ok := this.volMap[vid];!ok{
-		this.volMapLock.RUnlock()
+	defer this.volMapLock.RUnlock()
 
-		vurl, err := this.fetchVolumeUrl(vid)
-		if(err != nil){
-			return "",err
+	if vurls,ok := this.volMap[vid];ok {
+		if vurls==nil || len(vurls)==0{
+			return "",CACHED_BUT_NO_VOL_EXISTS
+		}
+		if len(vurls) == 1 {
+			if vurls[0] == exclude {
+				return "", ONE_CACHED_BUT_EXCLUDED
+			}
+			return vurls[0], nil
+		}
+
+		idx := this.rnd.Intn(len(vurls))
+		for ;vurls[idx]==exclude;{
+			idx = this.rnd.Intn(len(vurls))
+		}
+		return vurls[idx], nil
+	}
+
+	return "", NOT_CACHED_YET
+}
+
+func (this* weedclient)getVolumeUrl(path string, exclude string)(string,error){
+	vid, err := getVolId(path)
+	if err != nil {
+		return "", err
+	}
+	vurl, err := this.getVUrlFromCache(vid, exclude)
+	if err == nil {
+		return vurl, nil
+	}
+	switch err {
+	case ONE_CACHED_BUT_EXCLUDED, CACHED_BUT_NO_VOL_EXISTS:
+		lastQuerySec := atomic.LoadInt64(&this.lastVolumeUrlQuery)
+		nowSec := time.Now().Unix()
+		if nowSec - lastQuerySec > VOL_URL_QUERY_INTERVAL {
+			vurls, err := fetchVolumeUrlFromMaster(this.hc, this.root, vid)
+			atomic.StoreInt64(&this.lastVolumeUrlQuery, time.Now().Unix())
+			if (err != nil) {
+				return "", err
+			}
+			this.volMapLock.Lock()
+			this.volMap[vid] = vurls
+			this.volMapLock.Unlock()
+		}
+	case NOT_CACHED_YET:
+		vurls, err := fetchVolumeUrlFromMaster(this.hc, this.root, vid)
+		if (err != nil) {
+			return "", err
 		}
 		this.volMapLock.Lock()
-		this.volMap[vid]=vurl
+		this.volMap[vid] = vurls
 		this.volMapLock.Unlock()
-		return vurl,nil
-	}else {
-		this.volMapLock.RUnlock()
-		return vurl,nil
 	}
+	return this.getVUrlFromCache(vid, exclude)
 }
 
-func (this *weedclient)DoRead(path string) (int, []byte, error){
-	vurl,err:=this.getVolumeUrl(path)
+func (this* weedclient)doReadButExcludeVurl(path string, exclude string)(int, []byte, error, string){
+	vurl,err:=this.getVolumeUrl(path, exclude)
 	if err!=nil{
-		return -1,nil,err
+		return -1,nil,err,""
 	}
 
 	var buf []byte
-	buf, err = this.fetchFile("http://"+vurl+"/"+path);
+	buf, err = fetchFile(this.hc, "http://"+vurl+"/"+path);
 	if err != nil{
-		return -1,nil,err
+		return -1,nil,err,vurl
 	}
-	return len(buf),buf,nil
+	return len(buf),buf,nil,vurl
+}
+
+func (this *weedclient)DoRead(path string) (l int , b []byte, err error){
+	var vurl string
+	l,b,err,vurl = this.doReadButExcludeVurl(path, "")
+	if err != nil && vurl != ""{
+		//we have a volume server this for fid, but it failed, try other volume servers
+		var err2 error
+		l,b,err2,vurl = this.doReadButExcludeVurl(path, vurl)
+		if err2 == ONE_CACHED_BUT_EXCLUDED {
+			//no other volume servers
+			err = err2
+			return
+		}
+		return
+	}
+	return
 }
 type assignRst struct{
 	Fid string `json:"fid"`
+	PublicUrl string `json:"publicUrl"`
+	Url string `json:"url"`
 }
 type wroteRst struct{
 	Name string `json:"name"`
 	Size int `json:"size"`
 }
-func (this *weedclient)post(url string, content_type string, body []byte, failTry bool) (rspBody []byte, err error){
+func post(hc *http.Client, url string, content_type string, body []byte, failTry bool) (rspBody []byte, err error){
 	defer func(){
 		if err != nil && failTry{
-			rspBody, err = this.post(url, content_type, body, false)
+			rspBody, err = post(hc,url, content_type, body, false)
 		}
 	}();
 
@@ -133,7 +205,7 @@ func (this *weedclient)post(url string, content_type string, body []byte, failTr
 	if err != nil {
 		return
 	}
-	rsp,err =this.hc.Do(req)
+	rsp,err =hc.Do(req)
 	if err != nil {
 		return
 	}
@@ -142,10 +214,10 @@ func (this *weedclient)post(url string, content_type string, body []byte, failTr
 	return
 }
 
-func (this *weedclient)get(url string, failTry bool) (rspBody []byte, err error){
+func get(hc *http.Client, url string, failTry bool) (rspBody []byte, err error){
 	defer func(){
 		if err != nil && failTry{
-			rspBody, err = this.get(url, false)
+			rspBody, err = get(hc, url, false)
 		}
 	}();
 
@@ -155,7 +227,7 @@ func (this *weedclient)get(url string, failTry bool) (rspBody []byte, err error)
 	if err != nil {
 		return
 	}
-	rsp,err = this.hc.Do(req)
+	rsp,err = hc.Do(req)
 	if err != nil {
 		return
 	}
@@ -164,10 +236,10 @@ func (this *weedclient)get(url string, failTry bool) (rspBody []byte, err error)
 	return
 }
 
-func (this* weedclient)multiPartPut(url string, fileName string, body []byte, failTry bool) (rspBody []byte, err error){
+func multiPartPut(hc *http.Client,url string, fileName string, body []byte, failTry bool) (rspBody []byte, err error){
 	defer func(){
 		if err != nil && failTry{
-			rspBody, err = this.multiPartPut(url, fileName, body, false)
+			rspBody, err = multiPartPut(hc,url, fileName, body, false)
 		}
 	}();
 
@@ -199,7 +271,7 @@ func (this* weedclient)multiPartPut(url string, fileName string, body []byte, fa
 	}
 	req.Header.Set("Content-Type", multipartWriter.FormDataContentType())
 
-	rsp, err = this.hc.Do(req)
+	rsp, err = hc.Do(req)
 	if err != nil {
 		return
 	}
@@ -208,15 +280,15 @@ func (this* weedclient)multiPartPut(url string, fileName string, body []byte, fa
 	return
 }
 
-func (this *weedclient)DoWrite(refPath string, data[]byte) (string,error){
-	buf,err := this.post(this.root+"/dir/assign", "text/plain", nil, true)
+func (this *weedclient)DoWrite(refPath string, data[]byte, params string) (string,error){
+	buf,err := post(this.hc,this.root+"/dir/assign"+params, "text/plain", nil, true)
 	if err != nil {
 		return "", err
 	}
 
 	var fid string
+	rst := assignRst{}
 	if fid,err = func() (string,error){
-		rst := assignRst{}
 		//log.Println("to unmarshal", string(buf))
 		if err := json.Unmarshal(buf, &rst); err != nil {
 			return "", errors.New(fmt.Sprintf("decoding assign result %s failed %v", string(buf), err))
@@ -224,29 +296,34 @@ func (this *weedclient)DoWrite(refPath string, data[]byte) (string,error){
 		if rst.Fid=="" {
 			return "", errors.New(fmt.Sprintf("assign failed:%v", string(buf)))
 		}
+		if rst.PublicUrl=="" {
+			rst.PublicUrl = rst.Url
+		}
+		if rst.PublicUrl==""{
+			return "", errors.New("no volume url assigned")
+		}
+		if !strings.HasPrefix(rst.PublicUrl, "http"){
+			rst.PublicUrl = "http://"+rst.PublicUrl
+		}
 		fid = rst.Fid
 		return fid,nil
 	}();err != nil{
 		return "",err
 	}
 
-	vurl,err := this.getVolumeUrl(fid)
-	if err != nil{
-		return "", err
-	}
-	if err != nil {
-		return "",err
-	}
-
-	buf,err = this.multiPartPut("http://"+vurl + "/" + fid, refPath, data, true)
-	rst := wroteRst{}
+	buf,err = multiPartPut(this.hc, rst.PublicUrl + "/" + fid, refPath, data, true)
+	wroteRst := wroteRst{Size:-1}
 	//log.Println("upload response:", string(buf))
-	if err := json.Unmarshal(buf,&rst);err != nil{
+	if err := json.Unmarshal(buf,&wroteRst);err != nil{
 		return "",errors.New(fmt.Sprintf("decoding assign result %s failed %v", string(buf), err))
 	}
 
-	if rst.Size != len(data){
-		return "", errors.New(fmt.Sprintf("wrote %d but required %d", rst.Size, len(data)))
+	if wroteRst.Size == -1{
+		return "",errors.New("put to " + rst.PublicUrl + "/" + fid +" returns " + string(buf))
+	}
+
+	if wroteRst.Size != len(data){
+		return "", errors.New(fmt.Sprintf("wrote %d but required %d", wroteRst.Size, len(data)))
 	}
 
 	return fid, nil
@@ -266,3 +343,10 @@ func (this *weedclient)DoDelete(path string) error{
 	}
 	return nil
 }
+
+var ONE_CACHED_BUT_EXCLUDED = errors.New("only one url for vid but it is excluded")
+var NOT_CACHED_YET = errors.New("volume url not cached")
+var CACHED_BUT_NO_VOL_EXISTS = errors.New("no volume url reponse by master'")
+const(
+	VOL_URL_QUERY_INTERVAL = int64(5)
+)

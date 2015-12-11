@@ -26,7 +26,7 @@ func (this *fdfsclient)DoRead(path string) (int,[]byte,error){
 		return int(rsp.DownloadSize),rsp.Content.([]byte),nil
 	}
 }
-func (this *fdfsclient)DoWrite(refPath string, data[]byte) (string, error){
+func (this *fdfsclient)DoWrite(refPath string, data[]byte, params string) (string, error){
 	if rsp, err :=this.fdfs.UploadByBuffer(data, ".raw");err != nil{
 		log.Fatalln("upload error:", err)
 		return "",err
