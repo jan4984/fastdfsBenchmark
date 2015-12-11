@@ -24,6 +24,9 @@ type weedclient struct{
 	hc *http.Client
 	rnd *rand.Rand
 	lastVolumeUrlQuery int64
+	lastMasterSwitch int64
+	masters []string
+	rootLock *sync.Mutex
 }
 
 type volLookUpRst struct{
@@ -76,8 +79,8 @@ func getVolId(path string) (string, error){
 	return "", errors.New("path in wrong format:" + path)
 }
 
-func NewWeedFsClient(urlroot string, hc *http.Client) Fs{
-	log.Println("new seaweedfs client to", urlroot)
+func NewWeedFsClient(hc *http.Client, masterPeers string) Fs{
+	log.Println("new seaweedfs client to", masterPeers)
 	/*hc := http.Client{
 		Transport:&http.Transport{
 			Dial:(&net.Dialer{
@@ -87,10 +90,39 @@ func NewWeedFsClient(urlroot string, hc *http.Client) Fs{
 			MaxIdleConnsPerHost:100,
 		},
 	}*/
-	return &weedclient{urlroot, &sync.RWMutex{},
-		make(map[string][]string), hc,
-		rand.New(rand.NewSource(time.Now().Unix())),
-		0};
+	ps := strings.Split(masterPeers,",")
+	ret := &weedclient{
+		root:ps[0],
+		rootLock:&sync.Mutex{},
+		volMapLock:&sync.RWMutex{},
+		volMap:make(map[string][]string),
+		hc:hc,
+		rnd:rand.New(rand.NewSource(time.Now().Unix())),
+		lastVolumeUrlQuery:0,
+		lastMasterSwitch:0,
+		masters:ps,
+	};
+
+	return ret
+}
+
+func (this* weedclient)selectNewMasterPeer() bool{
+	if len(this.masters) <= 1 {
+		return false
+	}
+	this.rootLock.Lock()
+	defer this.rootLock.Unlock()
+	if time.Now().Unix() - this.lastMasterSwitch < VOL_URL_QUERY_INTERVAL{
+		return false
+	}
+	idx:=0
+	for ;this.masters[idx]==this.root;{
+		idx=this.rnd.Intn(len(this.masters))
+	}
+	this.root=this.masters[idx]
+	this.lastMasterSwitch = time.Now().Unix()
+
+	return true
 }
 
 func (this* weedclient)getVUrlFromCache(vid string, exclude string)(string, error){
@@ -132,7 +164,12 @@ func (this* weedclient)getVolumeUrl(path string, exclude string)(string,error){
 		lastQuerySec := atomic.LoadInt64(&this.lastVolumeUrlQuery)
 		nowSec := time.Now().Unix()
 		if nowSec - lastQuerySec > VOL_URL_QUERY_INTERVAL {
-			vurls, err := fetchVolumeUrlFromMaster(this.hc, this.root, vid)
+			vurls, err := fetchVolumeUrlFromMaster(this.hc, "http://"+this.root, vid)
+			if err != nil{
+				if this.selectNewMasterPeer(){
+					vurls, err = fetchVolumeUrlFromMaster(this.hc, "http://"+this.root, vid)
+				}
+			}
 			atomic.StoreInt64(&this.lastVolumeUrlQuery, time.Now().Unix())
 			if (err != nil) {
 				return "", err
@@ -142,7 +179,12 @@ func (this* weedclient)getVolumeUrl(path string, exclude string)(string,error){
 			this.volMapLock.Unlock()
 		}
 	case NOT_CACHED_YET:
-		vurls, err := fetchVolumeUrlFromMaster(this.hc, this.root, vid)
+		vurls, err := fetchVolumeUrlFromMaster(this.hc, "http://"+this.root, vid)
+		if err != nil{
+			if this.selectNewMasterPeer(){
+				vurls, err = fetchVolumeUrlFromMaster(this.hc, "http://"+this.root, vid)
+			}
+		}
 		if (err != nil) {
 			return "", err
 		}
@@ -281,7 +323,12 @@ func multiPartPut(hc *http.Client,url string, fileName string, body []byte, fail
 }
 
 func (this *weedclient)DoWrite(refPath string, data[]byte, params string) (string,error){
-	buf,err := post(this.hc,this.root+"/dir/assign"+params, "text/plain", nil, true)
+	buf,err := post(this.hc,"http://"+this.root+"/dir/assign"+params, "text/plain", nil, true)
+	if err != nil{
+		if this.selectNewMasterPeer(){
+			buf,err = post(this.hc,"http://"+this.root+"/dir/assign"+params, "text/plain", nil, true)
+		}
+	}
 	if err != nil {
 		return "", err
 	}
@@ -330,7 +377,12 @@ func (this *weedclient)DoWrite(refPath string, data[]byte, params string) (strin
 
 }
 func (this *weedclient)DoDelete(path string) error{
-	req,err := http.NewRequest("DELETE", this.root + "/" + path, nil)
+	req,err := http.NewRequest("DELETE", "http://"+this.root + "/" + path, nil)
+	if err != nil{
+		if this.selectNewMasterPeer(){
+			req,err = http.NewRequest("DELETE", "http://"+this.root + "/" + path, nil)
+		}
+	}
 	if err != nil {
 		return err
 	}

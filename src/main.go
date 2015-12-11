@@ -151,7 +151,7 @@ func main() {
 	case "fastdfs":
 		client = fstestbenchmark.NewFdfsClient(*fdfsCfgFile)
 	case "seaweedfs":
-		client = fstestbenchmark.NewWeedFsClient("http://" + *seaweedfsUrlRoot, &http.Client{
+		client = fstestbenchmark.NewWeedFsClient(&http.Client{
 			Transport:&http.Transport{
 				Dial:(&net.Dialer{
 					Timeout:5 * time.Second,
@@ -159,7 +159,7 @@ func main() {
 				}).Dial,
 				MaxIdleConnsPerHost:100,
 			},
-		})
+		},*seaweedfsUrlRoot)
 	}
 
 	for i:=0;i<td.Parallel;i++{
