@@ -199,7 +199,11 @@ func main() {
 						 }
 						 id,err := client.DoWrite("filename", writeBuf[0:t.writeLen], "?replication=001")
 						 if err != nil {
-							 log.Fatalln(err)
+							 log.Println("write failed, try again!!!")
+							 id,err = client.DoWrite("filename", writeBuf[0:t.writeLen], "?replication=001")
+							 if err != nil {
+								 log.Fatalln(err)
+							 }
 						 }
 						 //log.Println(i, "done write ", t.writeLen)
 						 wt:=int64(time.Now().Sub(start))
